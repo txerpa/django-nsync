@@ -3,11 +3,14 @@ from django.core.exceptions import (
     MultipleObjectsReturned,
     ObjectDoesNotExist,
     FieldDoesNotExist)
-from django.contrib.contenttypes.fields import ContentType
+from django.contrib.contenttypes.fields import ContentType, GenericForeignKey
+from django.contrib.postgres.fields import JSONField
+from django.db.models import Model
 from django.db.models.query_utils import Q
 from .models import ExternalKeyMapping
 from collections import defaultdict
 import logging
+import ast
 from .logging import StyleAdapter
 
 """
@@ -23,8 +26,9 @@ from raw input.
 """
 
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler()) # http://pieces.openpolitics.com/2012/04/python-logging-best-practices/
+logger.addHandler(logging.NullHandler())  # http://pieces.openpolitics.com/2012/04/python-logging-best-practices/
 logger = StyleAdapter(logger)
+
 
 def set_value_to_remote(object, attribute, value):
     target_attr = getattr(object, attribute)
@@ -35,6 +39,7 @@ def set_value_to_remote(object, attribute, value):
             target_attr.set(value)
     else:
         target_attr.add(value)
+
 
 class DissimilarActionTypesError(Exception):
 
@@ -49,9 +54,10 @@ class DissimilarActionTypesError(Exception):
             self.field_name,
             self.model_name)
 
+
 class UnknownActionType(Exception):
 
-    def __init__(self, action_type,field_name, model_name):
+    def __init__(self, action_type, field_name, model_name):
         self.action_type = action_type
         self.field_name = field_name
         self.model_name = model_name
@@ -61,6 +67,7 @@ class UnknownActionType(Exception):
             self.action_type,
             self.field_name,
             self.model_name)
+
 
 class ObjectSelector:
     OPERATORS = set(['|', '&', '~'])
@@ -77,6 +84,9 @@ class ObjectSelector:
 
         self.match_on = match_on
         self.fields = available_fields
+
+    def __str__(self):
+        return self.match_on
 
     def get_by(self):
         def build_selector(match):
@@ -105,7 +115,7 @@ class ObjectSelector:
                 if len(stack) < 2:
                     raise ValueError('Insufficient operands for operator:{}', match)
 
-                # remove the operands from the stack in reverse order 
+                # remove the operands from the stack in reverse order
                 # (preserves left-to-right reading)
                 operand2 = stack.pop()
                 operand1 = stack.pop()
@@ -134,32 +144,36 @@ class ModelAction:
     """
     REFERRED_TO_DELIMITER = '=>'
 
-    def __init__(self, model, match_on, fields={}):
+    def __init__(self, model, match_on, fields={}, rel_by_external_key=False,
+                 rel_by_external_key_excluded=False, external_system=None):
         """
         Create a base action.
 
         :param model:
         :param match_on:
         :param fields:
+        :param rel_by_external_key
+        :param rel_by_external_key_excluded
+        :param external_system
         :return:
         """
         if model is None:
             raise ValueError('model cannot be None')
-        if not match_on:
-            raise ValueError('match_on({}) must be not "empty"'.format(
-                match_on))
-
-        match_on = ObjectSelector(match_on, fields)
+        if match_on:
+            match_on = ObjectSelector(match_on, fields)
 
         self.model = model
         self.match_on = match_on
         self.fields = fields
+        self.rel_by_external_key = rel_by_external_key
+        self.rel_by_external_key_excluded = rel_by_external_key_excluded
+        self.external_system = external_system
 
     def __str__(self):
         return '{} - Model:{} - MatchFields:{} - Fields:{}'.format(
             self.__class__.__name__,
             self.model.__name__,
-            self.match_on.match_on,
+            self.match_on,
             self.fields)
 
     @property
@@ -170,7 +184,19 @@ class ModelAction:
         """Finds the object that matches the provided matching information"""
         return self.model.objects.get(self.match_on.get_by())
 
-    def execute(self):
+    def get_object_id_by_external_key(self, external_key, content_type):
+        try:
+            external_key_mapp = ExternalKeyMapping.objects.get(
+                external_system=self.external_system,
+                external_key=external_key,
+                content_type=content_type
+            )
+            return external_key_mapp.object_id
+        except ExternalKeyMapping.DoesNotExist:
+            logger.debug(f'Object of content type {content_type} and with external key {external_key} is not mapped!')
+            raise
+
+    def execute(self, use_bulk=False):
         """Does nothing"""
         pass
 
@@ -192,6 +218,10 @@ class ModelAction:
         # We store the referential attributes as a dict of dicts, this way
         # filtering against many fields is possible
         referential_attributes = defaultdict(dict)
+        generic_fks = []
+        if self.rel_by_external_key:
+            # Find all generic foreign key and it's fk field to be able to map these fields.
+            generic_fks = [field for field in object._meta.get_fields() if isinstance(field, GenericForeignKey)]
         for attribute, value in self.fields.items():
             if self.REFERRED_TO_DELIMITER in attribute and value != '':
                 ref_attr = attribute.split(self.REFERRED_TO_DELIMITER)
@@ -201,12 +231,38 @@ class ModelAction:
                     current_value = getattr(object, attribute, None)
                     if not (current_value is None or current_value is ''):
                         continue
+                field = object._meta.get_field(attribute)
                 try:
-                    if object._meta.get_field(attribute).null:
+                    if field.null:
                         value = None if value == '' else value
                 except FieldDoesNotExist:
                     pass
-                setattr(object, attribute, value)
+
+                if field.related_model and value and self.is_rel_model_mapped(field.related_model):
+                    content_type = ContentType.objects.get_for_model(field.related_model)
+                    value = self.get_object_id_by_external_key(value, content_type)
+                if isinstance(field, JSONField) and value:
+                    value = ast.literal_eval(value)
+                if self.rel_by_external_key and attribute in [generic_fk.fk_field for generic_fk in generic_fks]:
+                    # Map object id of generic foreign key
+                    # First find name of the content type field for generic foreign key
+                    content_type_field_name = None
+                    content_type_field_value = None
+                    for generic_fk in generic_fks:
+                        if generic_fk.fk_field == attribute:
+                            content_type_field_name = generic_fk.ct_field
+                    if content_type_field_name:
+                        content_type_column_name = object._meta.get_field(content_type_field_name).column
+                        for f_attribute, f_value in self.fields.items():
+                            if f_attribute == content_type_column_name:
+                                content_type_field_value = f_value
+                    if content_type_field_value:
+                        # Finally get mapped value of object id
+                        value = self.get_object_id_by_external_key(value, content_type_field_value)
+                    else:
+                        raise ValueError(f'Content type cannot be found for Generic foreign key with object '
+                                         f'\'{attribute}\' for model {object._meta.label}')
+                setattr(object, field.get_attname(), value)
 
         for attribute, get_by in referential_attributes.items():
             try:
@@ -221,11 +277,13 @@ class ModelAction:
                         set_value = setattr
                     else:
                         own_attribute = field.get_accessor_name()
+
                         def get_value_from_remote(object, attribute, default):
                             try:
                                 return getattr(object, attribute).get()
                             except:
                                 return default
+
                         get_current_value = get_value_from_remote
                         set_value = set_value_to_remote
 
@@ -238,7 +296,7 @@ class ModelAction:
                         if field.many_to_many:
                             action_type = None
                             get_by_exact = {}
-                            for k,v in get_by.items():
+                            for k, v in get_by.items():
                                 if action_type is None:
                                     action_type = k[0]
                                 elif action_type != k[0]:
@@ -248,9 +306,9 @@ class ModelAction:
                                 get_by_exact[k[1:]] = v
 
                             if action_type not in '+-=':
-                                raise UnknownActionType(action_type, 
-                                    field.verbose_name,
-                                    object.__class__.__name__)
+                                raise UnknownActionType(action_type,
+                                                        field.verbose_name,
+                                                        object.__class__.__name__)
 
                             target = field.related_model.objects.get(**get_by_exact)
 
@@ -287,16 +345,19 @@ class ModelAction:
                             object,
                             field.verbose_name)
             except FieldDoesNotExist as e:
-                logger.warning( 'Attibute "{}" does not exist on {}[{}]',
-                    attribute,
-                    object.__class__.__name__,
-                    object)
+                logger.warning('Attibute "{}" does not exist on {}[{}]',
+                               attribute,
+                               object.__class__.__name__,
+                               object)
 
             except DissimilarActionTypesError as e:
                 logger.warning('{}', e)
 
             except UnknownActionType as e:
                 logger.warning('{}', e)
+
+    def is_rel_model_mapped(self, related_model):
+        return self.rel_by_external_key and related_model._meta.db_table not in self.rel_by_external_key_excluded
 
 
 class CreateModelAction(ModelAction):
@@ -307,35 +368,93 @@ class CreateModelAction(ModelAction):
     found, nor will it update a matched object.
     """
 
-    def execute(self):
-        try:
-            return self.get_object()
-        except ObjectDoesNotExist as e:
-            pass
-        except MultipleObjectsReturned as e:
-            logger.warning('Mulitple objects found - {} Error:{}', str(self), e)
-            return None
+    def __init__(self, *args, **kwargs):
+        self.force_init_instace = kwargs.pop('force_init_instance', None)
+        super(CreateModelAction, self).__init__(*args, **kwargs)
 
+    def execute(self, use_bulk=False):
+        if self.match_on and not self.force_init_instace:
+            try:
+                return self.get_object()
+            except ObjectDoesNotExist as e:
+                pass
+            except MultipleObjectsReturned as e:
+                logger.warning('Mulitple objects found - {} Error:{}', str(self), e)
+                return None
 
-        obj=self.model()
+        obj = self.model()
         # NB: Create uses force to override defaults
         self.update_from_fields(obj, True)
-        obj.save()
+        if not use_bulk:
+            # Check if there is parents and if they are already created
+            if obj._meta.parents and \
+                all(getattr(obj, field.attname) is not None for parent, field in obj._meta.parents.items()):
+                # This is fix for multi-table inheritance problem and that model cannot be saved without explicitly
+                # setting parent data for the given model
+                # The way to associate existing parent with child is telling save_base not to save any parent models
+                obj.save_base(raw=True)
+            else:
+                # TODO: depending of configuration, call save of the instance or
+                # skip it and call save on the django model
+                Model.save(obj)
+                # obj.save()
         return obj
+
+    @staticmethod
+    def is_for_bulk_create(model_obj):
+        """
+        Check if model instance is candidate for bulk operation. If object has id means that either is
+        created new object beacuse bulk is disabled or it is existing object. In both cases insante is not candidate
+        for bulk
+        """
+        return not model_obj.id
 
     @property
     def type(self):
         return 'create'
 
 
-class CreateModelWithReferenceAction(CreateModelAction):
+class ReferenceActionMixin:
+
+    def __init__(self, *args, **kwargs):
+        super(ReferenceActionMixin, self).__init__(*args, **kwargs)
+        self.external_mapping_obj = None
+
+    def get_or_init_ext_mapp(self, force_init=False):
+        mapping_inst = ExternalKeyMapping(
+            external_system=self.external_system,
+            external_key=self.external_key,
+            content_type=ContentType.objects.get_for_model(self.model)
+        )
+        if force_init:
+            return mapping_inst
+
+        try:
+            mapping = ExternalKeyMapping.objects.get(
+                external_system=self.external_system,
+                external_key=self.external_key,
+                content_type=ContentType.objects.get_for_model(self.model),
+            )
+        except ExternalKeyMapping.DoesNotExist:
+            mapping = mapping_inst
+
+        return mapping
+
+    @staticmethod
+    def map_to_external_object(external_mapping_obj, model_obj):
+        external_mapping_obj.content_object = model_obj
+        external_mapping_obj.object_id = model_obj.id
+
+
+class CreateModelWithReferenceAction(ReferenceActionMixin, CreateModelAction):
     """
     Action to create a model object if it does not exist, and to create or
     update an external reference to the object.
     """
 
     def __init__(self, external_system, model,
-                 external_key, match_on, fields={}):
+                 external_key, match_on, fields={}, rel_by_external_key=False,
+                 rel_by_external_key_excluded=False, force_init_instance=False):
         """
 
         :param external_system (model object): The external system to create or
@@ -346,37 +465,32 @@ class CreateModelWithReferenceAction(CreateModelAction):
         :param model (class): See definition on super class
         :param match_on (list): See definition on super class
         :param fields(dict): See definition on super class
+        :param rel_by_external_key(bool): See definition on super class
+        :param rel_by_external_key_excluded (list): See definition on super class
         :return: The model object provided by the action
         """
         super(CreateModelWithReferenceAction, self).__init__(
-            model, match_on, fields)
-        self.external_system=external_system
-        self.external_key=external_key
+            model, match_on, fields=fields, rel_by_external_key=rel_by_external_key,
+            rel_by_external_key_excluded=rel_by_external_key_excluded, external_system=external_system,
+            force_init_instance=force_init_instance
+        )
+        self.external_key = external_key
 
-    def execute(self):
-        try:
-            mapping=ExternalKeyMapping.objects.get(
-                external_system=self.external_system,
-                external_key=self.external_key)
-        except ExternalKeyMapping.DoesNotExist:
-            mapping=ExternalKeyMapping(
-                external_system=self.external_system,
-                external_key=self.external_key)
+    def execute(self, use_bulk=False):
+        self.external_mapping_obj = self.get_or_init_ext_mapp(self.force_init_instace)
 
-        model_obj=mapping.content_object
+        model_obj = self.external_mapping_obj.content_object
         if model_obj is None:
-            model_obj=super(CreateModelWithReferenceAction, self).execute()
-
-        if model_obj:
-            mapping.content_type=ContentType.objects.get_for_model(
-                self.model)
-            mapping.content_object=model_obj
-            mapping.object_id=model_obj.id
-            mapping.save()
+            model_obj = super(CreateModelWithReferenceAction, self).execute(use_bulk=use_bulk)
+        if model_obj and not self.is_for_bulk_create(model_obj) and model_obj.id != self.external_mapping_obj.object_id:
+            self.map_to_external_object(self.external_mapping_obj, model_obj)
+            self.external_mapping_obj.save()
         return model_obj
 
 
 from django.db import IntegrityError, transaction
+
+
 class UpdateModelAction(ModelAction):
     """
     Action to update the fields of a model object, but not create an
@@ -397,21 +511,21 @@ class UpdateModelAction(ModelAction):
             forced or only affect 'empty' fields. Default:False
         :return: The updated object (if a matching object is found) or None.
         """
-        super(UpdateModelAction, self).__init__(
-            model, match_on, fields)
-        self.force_update=force_update
+        super(UpdateModelAction, self).__init__(model, match_on, fields)
+        self.force_update = force_update
 
     @property
     def type(self):
         return 'update'
 
-    def execute(self):
+    def execute(self, use_bulk=False):
         try:
-            obj=self.get_object()
+            obj = self.get_object()
             self.update_from_fields(obj, self.force_update)
 
-            with transaction.atomic():
-                obj.save()
+            if not use_bulk:
+                with transaction.atomic():
+                    obj.save()
 
             return obj
         except ObjectDoesNotExist:
@@ -423,14 +537,15 @@ class UpdateModelAction(ModelAction):
             logger.warning('Integrity issue - {} Error:{}', str(self), e)
             return None
 
-class UpdateModelWithReferenceAction(UpdateModelAction):
+
+class UpdateModelWithReferenceAction(ReferenceActionMixin, UpdateModelAction):
     """
     Action to create a model object if it does not exist, and to create or
     update an external reference to the object.
     """
 
     def __init__(self, external_system, model, external_key, match_on,
-                 fields={}, force_update=False):
+                 fields={}, force_update=False, rel_by_external_key=False, rel_by_external_key_excluded=False):
         """
 
         :param external_system (model object): The external system to create or
@@ -442,28 +557,23 @@ class UpdateModelWithReferenceAction(UpdateModelAction):
         :param model (class): See definition on super class
         :param match_on (list): See definition on super class
         :param fields(dict): See definition on super class
+        :param rel_by_external_key(bool): See definition on super class
+        :param rel_by_external_key_excluded (list): See definition on super class
         :return: The updated object (if an object is found) or None.
         """
         super(UpdateModelWithReferenceAction, self).__init__(
-            model, match_on, fields, force_update)
-        self.external_system=external_system
-        self.external_key=external_key
+            model, match_on, fields=fields, force_update=force_update, rel_by_external_key=rel_by_external_key,
+            rel_by_external_key_excluded=rel_by_external_key_excluded, external_system=external_system)
+        self.external_key = external_key
 
-    def execute(self):
+    def execute(self, use_bulk=False):
+        self.external_mapping_obj = self.get_or_init_ext_mapp()
+
+        linked_object = self.external_mapping_obj.content_object
+
+        matched_object = None
         try:
-            mapping=ExternalKeyMapping.objects.get(
-                external_system=self.external_system,
-                external_key=self.external_key)
-        except ExternalKeyMapping.DoesNotExist:
-            mapping=ExternalKeyMapping(
-                external_system=self.external_system,
-                external_key=self.external_key)
-
-        linked_object=mapping.content_object
-
-        matched_object=None
-        try:
-            matched_object=self.get_object()
+            matched_object = self.get_object()
         except ObjectDoesNotExist:
             pass
         except MultipleObjectsReturned as e:
@@ -472,35 +582,32 @@ class UpdateModelWithReferenceAction(UpdateModelAction):
 
         # If both matched and linked objects exist but are different,
         # get rid of the matched one
-        if matched_object and linked_object and (matched_object != 
+        if matched_object and linked_object and (matched_object !=
                                                  linked_object):
             matched_object.delete()
 
         # Choose the most appropriate object to update
         if linked_object:
-            model_obj=linked_object
+            model_obj = linked_object
         elif matched_object:
-            model_obj=matched_object
+            model_obj = matched_object
         else:
             # No object to update
             return None
 
         if model_obj:
             self.update_from_fields(model_obj, self.force_update)
-            try:
-                with transaction.atomic():
-                    model_obj.save()
-            except IntegrityError as e:
-                logger.warning('Integrity issue - {} Error:{}', str(self), e)
-                return None
+            if not use_bulk:
+                try:
+                    with transaction.atomic():
+                        model_obj.save()
+                except IntegrityError as e:
+                    logger.warning('Integrity issue - {} Error:{}', str(self), e)
+                    return None
 
-        if model_obj:
-            mapping.content_type=ContentType.objects.get_for_model(
-                self.model)
-            mapping.content_object=model_obj
-            mapping.object_id=model_obj.id
-            mapping.save()
-
+        if model_obj and not use_bulk and model_obj.id != self.external_mapping_obj.object_id:
+            self.map_to_external_object(self.external_mapping_obj, model_obj)
+            self.external_mapping_obj.save()
         return model_obj
 
 
@@ -514,29 +621,41 @@ class DeleteIfOnlyReferenceModelAction(ModelAction):
     """
 
     def __init__(self, external_system, external_key, delete_action):
-        self.delete_action=delete_action
-        self.external_key=external_key
-        self.external_system=external_system
+        self.delete_action = delete_action
+        self.external_key = external_key
+        self.external_system = external_system
 
     @property
     def type(self):
         return self.delete_action.type
 
-    def execute(self):
+    def execute(self, use_bulk=False):
         try:
-            obj=self.delete_action.get_object()
-
-            key_mapping=ExternalKeyMapping.objects.get(
-                object_id=obj.id,
-                content_type=ContentType.objects.get_for_model(
-                    self.delete_action.model),
-                external_key=self.external_key)
-
-            if key_mapping.external_system == self.external_system:
-                self.delete_action.execute()
+            if self.delete_action.match_on:
+                obj = self.delete_action.get_object()
+                # Note: Check if obj will be deleted if there is another external system with ref on that object
+                key_mapping = ExternalKeyMapping.objects.get(
+                    object_id=obj.id,
+                    content_type=ContentType.objects.get_for_model(
+                        self.delete_action.model),
+                    external_key=self.external_key)
+                if key_mapping.external_system == self.external_system:
+                    return self.delete_action.execute(obj=obj, use_bulk=use_bulk)
+                else:
+                    # The key mapping is not 'this' systems key mapping
+                    pass
             else:
-                # The key mapping is not 'this' systems key mapping
-                pass
+                # Find object by external key and external system
+                key_mapping = ExternalKeyMapping.objects.get(
+                    content_type=ContentType.objects.get_for_model(
+                        self.delete_action.model),
+                    external_key=self.external_key,
+                    external_system=self.external_system
+                )
+                obj = key_mapping.content_object
+                if obj:
+                    return self.delete_action.execute(obj=obj, use_bulk=use_bulk)
+
         except MultipleObjectsReturned:
             # There are multiple key mappings or multiple target objects, we shouldn't delete the object
             return
@@ -550,11 +669,18 @@ class DeleteModelAction(ModelAction):
     def type(self):
         return 'delete'
 
-    def execute(self):
+    def execute(self, obj=None, use_bulk=False):
         """Forcibly delete any objects found by the
         ModelAction.get_object() method."""
         try:
-            self.get_object().delete()
+            obj = obj or self.get_object()
+            if not use_bulk:
+                # TODO: depending of configuration, call delete of the instance or skip it
+                # and call delete of the django model
+                Model.delete(obj)
+                # inst.delete()
+                # obj.delete()
+            return obj
         except ObjectDoesNotExist:
             pass
         except MultipleObjectsReturned as e:
@@ -567,15 +693,16 @@ class DeleteExternalReferenceAction:
     A model action to remove the ExternalKeyMapping object for a model object.
     """
 
-    def __init__(self, external_system, external_key):
-        self.external_system=external_system
-        self.external_key=external_key
+    def __init__(self, model, external_system, external_key):
+        self.model = model
+        self.external_system = external_system
+        self.external_key = external_key
 
     @property
     def type(self):
         return 'delete'
 
-    def execute(self):
+    def execute(self, use_bulk=False):
         """
         Deletes all ExternalKeyMapping objects that match the provided external
         system and external key.
@@ -583,7 +710,8 @@ class DeleteExternalReferenceAction:
         """
         ExternalKeyMapping.objects.filter(
             external_system=self.external_system,
-            external_key=self.external_key).delete()
+            external_key=self.external_key,
+            content_type=ContentType.objects.get_for_model(self.model)).delete()
 
 
 class ActionFactory:
@@ -638,17 +766,24 @@ class ActionFactory:
     one will be able to delete the object).
     """
 
-    def __init__(self, model, external_system=None):
+    def __init__(self, model, external_system=None, rel_by_external_key=False,
+                 rel_by_external_key_excluded=False, force_init_instance=False):
         """
         Create an actions factory for a given Django Model.
 
         :param model: The model to use for the actions
         :param external_system: (Optional) The external system object to
             create links against
+        :param rel_by_external_key: (Optional) If related field is referenced by external key
+        :param rel_by_external_key_excluded: (Optional) Relations that are excpeted from rel_by_external_key
+        :param force_init_instance: (Optional) Whether to prevent from checking the database for existing instances
         :return: A new actions factory
         """
-        self.model=model
-        self.external_system=external_system
+        self.model = model
+        self.external_system = external_system
+        self.rel_by_external_key = rel_by_external_key
+        self.rel_by_external_key_excluded = rel_by_external_key_excluded
+        self.force_init_instance = force_init_instance
 
     def is_externally_mappable(self, external_key):
         """
@@ -682,43 +817,55 @@ class ActionFactory:
         :param fields:
         :return:
         """
-        actions=[]
+        actions = []
 
         if sync_actions.is_impotent():
-            actions.append(ModelAction(self.model, match_on, fields))
+            actions.append(ModelAction(self.model, match_on,
+                                       fields=fields,
+                                       rel_by_external_key=self.rel_by_external_key,
+                                       rel_by_external_key_excluded=self.rel_by_external_key_excluded
+                                       ))
 
         if sync_actions.delete:
-            action=DeleteModelAction(self.model, match_on, fields)
+            action = DeleteModelAction(self.model, match_on, fields=fields)
             if self.is_externally_mappable(external_system_key):
                 if not sync_actions.force:
-                    action=DeleteIfOnlyReferenceModelAction(
+                    action = DeleteIfOnlyReferenceModelAction(
                         self.external_system, external_system_key, action)
                 actions.append(action)
                 actions.append(DeleteExternalReferenceAction(
-                    self.external_system, external_system_key))
+                    self.model, self.external_system, external_system_key))
             elif sync_actions.force:
                 actions.append(action)
 
         if sync_actions.create:
             if self.is_externally_mappable(external_system_key):
-                action=CreateModelWithReferenceAction(self.external_system,
-                                                        self.model,
-                                                        external_system_key,
-                                                        match_on,
-                                                        fields)
+                action = CreateModelWithReferenceAction(
+                    self.external_system,
+                    self.model,
+                    external_system_key,
+                    match_on,
+                    fields=fields,
+                    rel_by_external_key=self.rel_by_external_key,
+                    rel_by_external_key_excluded=self.rel_by_external_key_excluded,
+                    force_init_instance=self.force_init_instance
+                )
             else:
-                action=CreateModelAction(self.model, match_on, fields)
+                action = CreateModelAction(self.model, match_on, fields, force_init_instance=self.force_init_instance)
             actions.append(action)
         if sync_actions.update:
             if self.is_externally_mappable(external_system_key):
-                action=UpdateModelWithReferenceAction(self.external_system,
-                                                        self.model,
-                                                        external_system_key,
-                                                        match_on,
-                                                        fields,
-                                                        sync_actions.force)
+                action = UpdateModelWithReferenceAction(
+                    self.external_system,
+                    self.model,
+                    external_system_key,
+                    match_on,
+                    fields=fields,
+                    force_update=sync_actions.force,
+                    rel_by_external_key=self.rel_by_external_key,
+                    rel_by_external_key_excluded=self.rel_by_external_key_excluded)
             else:
-                action=UpdateModelAction(self.model, match_on,
+                action = UpdateModelAction(self.model, match_on,
                                            fields, sync_actions.force)
 
             actions.append(action)
@@ -738,10 +885,10 @@ class SyncActions:
         if delete and update:
             raise ValueError("Cannot delete AND update")
 
-        self.create=create
-        self.update=update
-        self.delete=delete
-        self.force=force
+        self.create = create
+        self.update = update
+        self.delete = delete
+        self.force = force
 
     def __str__(self):
         return "SyncActions {}{}{}{}".format(

@@ -1,4 +1,6 @@
+import importlib
 from django.core.management.base import CommandError  # TODO replace error
+from django.conf import settings
 from django.apps.registry import apps
 import csv
 
@@ -53,9 +55,10 @@ class CsvActionFactory(ActionFactory):
             return []
 
         action_flags = raw_values.pop(self.action_flags_label)
-        match_on = raw_values.pop(self.match_on_label)
-        match_on = match_on.split(
-            self.match_on_delimiter)
+        match_on = raw_values.pop(self.match_on_label, None)
+        if match_on:
+            match_on = match_on.split(
+                self.match_on_delimiter)
         external_system_key = raw_values.pop(self.external_key_label, None)
 
         sync_actions = CsvSyncActionsDecoder.decode(action_flags)
@@ -93,3 +96,48 @@ class CsvSyncActionsDecoder:
                 pass
 
         return SyncActions(create, update, delete, force)
+
+
+def get_signal_info(signal, model_name):
+    def get_receiver(signal_sett):
+        receiver_path = signal_sett.get('receiver')
+        if receiver_path:
+            # split receiver path to module and function inside module
+            receiver_slices = receiver_path.rsplit('.', 1)
+            module = importlib.import_module(receiver_slices[0])
+            receiver = getattr(module, receiver_slices[1])
+            return receiver
+        return None
+
+    def get_dispatch(signal_sett, model_name):
+        dispatch_uid = signal_sett.get('dispatch_uid')
+        return dispatch_uid.format(model_name=model_name) if dispatch_uid else None
+
+    signal_sett = settings.SYNC_SIGNAL_DISCONNECT.get(signal, {})
+    return get_receiver(signal_sett), get_dispatch(signal_sett, model_name.lower())
+
+
+class temp_disconnect_signal():
+    """ Temporarily disconnect a model from a signal """
+
+    def __init__(self, signal, receiver, sender, dispatch_uid=None):
+        self.signal = signal
+        self.receiver = receiver
+        self.sender = sender
+        self.dispatch_uid = dispatch_uid
+
+    def __enter__(self):
+        if self.receiver or self.dispatch_uid:
+            self.signal.disconnect(
+                receiver=self.receiver,
+                sender=self.sender,
+                dispatch_uid=self.dispatch_uid
+            )
+
+    def __exit__(self, type, value, traceback):
+        if self.receiver or self.dispatch_uid:
+            self.signal.connect(
+                receiver=self.receiver,
+                sender=self.sender,
+                dispatch_uid=self.dispatch_uid
+            )

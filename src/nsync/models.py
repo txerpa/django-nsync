@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
+from tenant_schemas.models import MultitenantMixin
 
 
 class ExternalSystem(models.Model):
@@ -29,7 +30,7 @@ class ExternalSystem(models.Model):
         return self.description if self.description else self.name
 
 
-class ExternalKeyMapping(models.Model):
+class ExternalKeyMapping(MultitenantMixin):
     """
     Key Mappings for objects in our system to objects in external systems
     """
@@ -47,8 +48,8 @@ class ExternalKeyMapping(models.Model):
     )
 
     class Meta:
-        index_together = ('external_system', 'external_key')
-        unique_together = ('external_system', 'external_key')
+        index_together = ('external_system', 'external_key', 'content_type', 'tenant')
+        unique_together = ('external_system', 'external_key', 'content_type', 'tenant')
         verbose_name = 'External Key Mapping'
 
     def __str__(self):

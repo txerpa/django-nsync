@@ -38,6 +38,35 @@ class Command(BaseCommand):
             type=bool,
             default=True,
             help='Wrap all of the actions in a DB transaction Default:True')
+        parser.add_argument(
+            '--rel_by_external_key',
+            type=bool,
+            default=False,
+            help='If related field is referenced by external key'
+        )
+        parser.add_argument(
+            '--rel_by_external_key_excluded',
+            action='append',
+            default=[],
+            help='Name of tables for which related fields are not referenced by external key. '
+                 'These are exceptions for rel_by_external_key'
+        )
+        parser.add_argument(
+            '--use_bulk',
+            type=bool,
+            default=False,
+            help='Controls whether operations should be performed in bulk. '
+                 'By default, an object\'s save() method is called for each row in a data set. '
+                 'When bulk is enabled, objects are saved using bulk operations'
+        )
+        parser.add_argument(
+            '--force_init_instance',
+            type=bool,
+            default=False,
+            help='If True, this parameter will prevent from checking the database for existing instances. '
+                 'Enabling this parameter is a performance improvement if data is guaranteed to contain '
+                 'new instances only'
+        )
 
     def handle(self, *args, **options):
         external_system = ExternalSystemHelper.find(
@@ -54,19 +83,30 @@ class Command(BaseCommand):
             SyncFileAction.sync(external_system,
                                 model,
                                 f,
-                                options['as_transaction'])
+                                use_transaction=options['as_transaction'],
+                                rel_by_external_key=options['rel_by_external_key'],
+                                rel_by_external_key_excluded=options['rel_by_external_key_excluded'],
+                                use_bulk=options['use_bulk'],
+                                force_init_instance=options['force_init_instance']
+                                )
 
 
 class SyncFileAction:
     @staticmethod
-    def sync(external_system, model, file, use_transaction):
+    def sync(external_system, model, file, use_transaction=True,
+             rel_by_external_key=False, rel_by_external_key_excluded=False,
+             use_bulk=False, force_init_instance=False):
         reader = csv.DictReader(file)
-        builder = CsvActionFactory(model, external_system)
-        actions = []
-        for d in reader:
-            actions.extend(builder.from_dict(d))
+        builder = CsvActionFactory(model, external_system=external_system,
+                                   rel_by_external_key=rel_by_external_key,
+                                   rel_by_external_key_excluded=rel_by_external_key_excluded,
+                                   force_init_instance=force_init_instance)
 
-        policy = BasicSyncPolicy(actions)
+        def get_actions():
+            for d in reader:
+                yield builder.from_dict(d)
+
+        policy = BasicSyncPolicy(get_actions(), use_bulk=use_bulk, model=model)
 
         if use_transaction:
             policy = TransactionSyncPolicy(policy)
