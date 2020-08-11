@@ -219,6 +219,7 @@ class ModelAction:
         # filtering against many fields is possible
         referential_attributes = defaultdict(dict)
         generic_fks = []
+        generic_fk_objs = dict()
         if self.rel_by_external_key:
             # Find all generic foreign key and it's fk field to be able to map these fields.
             generic_fks = [field for field in object._meta.get_fields() if isinstance(field, GenericForeignKey)]
@@ -244,24 +245,7 @@ class ModelAction:
                 if isinstance(field, JSONField) and value:
                     value = ast.literal_eval(value)
                 if self.rel_by_external_key and attribute in [generic_fk.fk_field for generic_fk in generic_fks]:
-                    # Map object id of generic foreign key
-                    # First find name of the content type field for generic foreign key
-                    content_type_field_name = None
-                    content_type_field_value = None
-                    for generic_fk in generic_fks:
-                        if generic_fk.fk_field == attribute:
-                            content_type_field_name = generic_fk.ct_field
-                    if content_type_field_name:
-                        content_type_column_name = object._meta.get_field(content_type_field_name).column
-                        for f_attribute, f_value in self.fields.items():
-                            if f_attribute == content_type_column_name:
-                                content_type_field_value = f_value
-                    if content_type_field_value:
-                        # Finally get mapped value of object id
-                        value = self.get_object_id_by_external_key(value, content_type_field_value)
-                    else:
-                        raise ValueError(f'Content type cannot be found for Generic foreign key with object '
-                                         f'\'{attribute}\' for model {object._meta.label}')
+                    generic_fk_objs[attribute] = value
                 setattr(object, field.get_attname(), value)
 
         for attribute, get_by in referential_attributes.items():
@@ -355,6 +339,27 @@ class ModelAction:
 
             except UnknownActionType as e:
                 logger.warning('{}', e)
+
+        for gfk_obj_attr, value in generic_fk_objs.items():
+            # Map object id of generic foreign key
+            # First find name of the content type field for generic foreign key
+            content_type_field_name = None
+            content_type_field_value = None
+            for generic_fk in generic_fks:
+                if generic_fk.fk_field == gfk_obj_attr:
+                    content_type_field_name = generic_fk.ct_field
+            # Get value of content type field
+            if content_type_field_name:
+                content_type_column_name = object._meta.get_field(content_type_field_name).column
+                content_type_field_value = getattr(object, content_type_column_name)
+            if content_type_field_value:
+                # Finally get mapped value of object id
+                value = self.get_object_id_by_external_key(value, content_type_field_value)
+            else:
+                raise ValueError(f'Content type cannot be found for Generic foreign key with object '
+                                 f'\'{attribute}\' for model {object._meta.label}')
+            field = object._meta.get_field(gfk_obj_attr)
+            setattr(object, field.get_attname(), value)
 
     def is_rel_model_mapped(self, related_model):
         return self.rel_by_external_key and related_model._meta.db_table not in self.rel_by_external_key_excluded
