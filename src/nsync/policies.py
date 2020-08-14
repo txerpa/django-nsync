@@ -10,6 +10,7 @@ import logging
 
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 class BasicSyncPolicy:
@@ -45,6 +46,9 @@ class BasicSyncPolicy:
         self.disabled_auto_now_date_fields = list()
         self.header = []
 
+        self.num_of_model_actions = 0
+        self.num_of_executed_actions = 0
+
     def execute(self, actions=None):
         # When bulk oper is used signals are disabled by default, so check if signals have to be disabled
         # in the case bulk is not used
@@ -75,21 +79,28 @@ class BasicSyncPolicy:
             self.bulk_update_with_ref()
             self.bulk_delete()
         self.turn_on_auto_now()
+        if self.num_of_model_actions != self.num_of_executed_actions:
+            logger.warning(f'Actions are skipped! {self.num_of_model_actions - self.num_of_executed_actions} '
+                           f'actions are not executed for the model {self.model._meta.db_table}')
 
     def execute_actions(self, actions):
         actions = actions or self.actions
         for row_actions in actions:
+            row_action_types = []
             for action in row_actions:
+                if action.type not in row_action_types:
+                    row_action_types.append(action.type)
                 if action.type != self.DELETE and not self.header:
                     self.header = action.fields.keys()
                     self.turn_off_auto_now()
                 self.execute_row_action(action)
+            self.num_of_model_actions += len(row_action_types)
 
     def execute_row_action(self, action):
         instance = action.execute(use_bulk=self.use_bulk)
         if self.use_bulk and instance:
-            # Note: It is importat to keep this order of bulk action execution -> create-update-delete
-            if action.type == self.CREATE and action.is_for_bulk_create(instance):
+            # Note: It is important to keep this order of bulk action execution -> create-update-delete
+            if action.type == self.CREATE and not action.obj_already_created:
                 self.append_for_bulk(action, instance, self.create_instances, self.create_ref_instances)
                 if self.has_batch_size(self.create_instances):
                     self.bulk_create_with_ref()
@@ -101,6 +112,8 @@ class BasicSyncPolicy:
                 self.delete_instances.append(instance)
                 if self.has_batch_size(self.delete_instances):
                     self.bulk_delete()
+        elif instance:
+            self.num_of_executed_actions += 1
 
     def append_for_bulk(self, action, instance, instances, ref_instances):
         instances.append(instance)
@@ -112,12 +125,14 @@ class BasicSyncPolicy:
 
     def bulk_create_with_ref(self):
         created_instances = self.bulk_create(self.model, self.create_instances)
+        self.num_of_executed_actions += len(created_instances)
         if self.create_ref_instances:
             self.map_to_external_objects(created_instances, self.create_ref_instances)
             self.bulk_create(ExternalKeyMapping, self.create_ref_instances)
 
     def bulk_update_with_ref(self):
         updated_instances = self.bulk_update(self.model, self.update_instances, self.header)
+        self.num_of_executed_actions += len(updated_instances)
         if self.update_ref_instances:
             self.map_to_external_objects(updated_instances, self.update_ref_instances)
             self.bulk_update(ExternalKeyMapping, self.update_ref_instances, ['object_id'])
@@ -180,6 +195,7 @@ class BasicSyncPolicy:
             if len(self.delete_instances) > 0:
                 delete_ids = [o.pk for o in self.delete_instances]
                 self.model.objects.filter(pk__in=delete_ids).delete()
+                self.num_of_executed_actions += len(delete_ids)
         except Exception as e:
             logger.exception(e)
         finally:
