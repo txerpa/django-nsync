@@ -192,8 +192,8 @@ class ModelAction:
                 content_type=content_type
             )
             return external_key_mapp.object_id
-        except ExternalKeyMapping.DoesNotExist:
-            logger.debug(f'Object of content type {content_type} and with external key {external_key} is not mapped!')
+        except ExternalKeyMapping.DoesNotExist as e:
+            logger.warning('External mapping issue - {} Error: {}', str(self), e)
             raise
 
     def execute(self, use_bulk=False):
@@ -232,21 +232,24 @@ class ModelAction:
                     current_value = getattr(object, attribute, None)
                     if not (current_value is None or current_value is ''):
                         continue
-                field = object._meta.get_field(attribute)
                 try:
+                    field = object._meta.get_field(attribute)
                     if field.null:
                         value = None if value == '' else value
+                    if field.related_model and value and self.is_rel_model_mapped(field.related_model):
+                        content_type = ContentType.objects.get_for_model(field.related_model)
+                        value = self.get_object_id_by_external_key(value, content_type)
+                    if isinstance(field, JSONField) and value:
+                        try:
+                            value = ast.literal_eval(value)
+                        except ValueError:
+                            pass
                 except FieldDoesNotExist:
                     pass
 
-                if field.related_model and value and self.is_rel_model_mapped(field.related_model):
-                    content_type = ContentType.objects.get_for_model(field.related_model)
-                    value = self.get_object_id_by_external_key(value, content_type)
-                if isinstance(field, JSONField) and value:
-                    value = ast.literal_eval(value)
                 if self.rel_by_external_key and attribute in [generic_fk.fk_field for generic_fk in generic_fks]:
                     generic_fk_objs[attribute] = value
-                setattr(object, field.get_attname(), value)
+                setattr(object, attribute, value)
 
         for attribute, get_by in referential_attributes.items():
             try:
@@ -310,7 +313,6 @@ class ModelAction:
                         else:
                             target = field.related_model.objects.get(**get_by)
                             set_value(object, own_attribute, target)
-                            logger.debug(object)
 
                     except ObjectDoesNotExist as e:
                         logger.warning(
@@ -358,8 +360,7 @@ class ModelAction:
             else:
                 raise ValueError(f'Content type cannot be found for Generic foreign key with object '
                                  f'\'{attribute}\' for model {object._meta.label}')
-            field = object._meta.get_field(gfk_obj_attr)
-            setattr(object, field.get_attname(), value)
+            setattr(object, gfk_obj_attr, value)
 
     def is_rel_model_mapped(self, related_model):
         return self.rel_by_external_key and related_model._meta.db_table not in self.rel_by_external_key_excluded
@@ -375,12 +376,15 @@ class CreateModelAction(ModelAction):
 
     def __init__(self, *args, **kwargs):
         self.force_init_instace = kwargs.pop('force_init_instance', None)
+        self.obj_already_created = False
         super(CreateModelAction, self).__init__(*args, **kwargs)
 
     def execute(self, use_bulk=False):
         if self.match_on and not self.force_init_instace:
             try:
-                return self.get_object()
+                obj = self.get_object()
+                self.obj_already_created = True
+                return obj
             except ObjectDoesNotExist as e:
                 pass
             except MultipleObjectsReturned as e:
@@ -389,7 +393,10 @@ class CreateModelAction(ModelAction):
 
         obj = self.model()
         # NB: Create uses force to override defaults
-        self.update_from_fields(obj, True)
+        try:
+            self.update_from_fields(obj, True)
+        except ExternalKeyMapping.DoesNotExist:
+            return None
         if not use_bulk:
             # Check if there is parents and if they are already created
             if obj._meta.parents and \
@@ -404,15 +411,6 @@ class CreateModelAction(ModelAction):
                 Model.save(obj)
                 # obj.save()
         return obj
-
-    @staticmethod
-    def is_for_bulk_create(model_obj):
-        """
-        Check if model instance is candidate for bulk operation. If object has id means that either is
-        created new object beacuse bulk is disabled or it is existing object. In both cases insante is not candidate
-        for bulk
-        """
-        return not model_obj.id
 
     @property
     def type(self):
@@ -487,7 +485,7 @@ class CreateModelWithReferenceAction(ReferenceActionMixin, CreateModelAction):
         model_obj = self.external_mapping_obj.content_object
         if model_obj is None:
             model_obj = super(CreateModelWithReferenceAction, self).execute(use_bulk=use_bulk)
-        if model_obj and not self.is_for_bulk_create(model_obj) and model_obj.id != self.external_mapping_obj.object_id:
+        if not use_bulk and model_obj and model_obj.pk and model_obj.pk != self.external_mapping_obj.object_id:
             self.map_to_external_object(self.external_mapping_obj, model_obj)
             self.external_mapping_obj.save()
         return model_obj
@@ -534,6 +532,8 @@ class UpdateModelAction(ModelAction):
 
             return obj
         except ObjectDoesNotExist:
+            return None
+        except ExternalKeyMapping.DoesNotExist as e:
             return None
         except MultipleObjectsReturned as e:
             logger.warning('Mulitple objects found - {} Error:{}', str(self), e)
@@ -601,7 +601,10 @@ class UpdateModelWithReferenceAction(ReferenceActionMixin, UpdateModelAction):
             return None
 
         if model_obj:
-            self.update_from_fields(model_obj, self.force_update)
+            try:
+                self.update_from_fields(model_obj, self.force_update)
+            except ExternalKeyMapping.DoesNotExist:
+                return None
             if not use_bulk:
                 try:
                     with transaction.atomic():
@@ -610,7 +613,7 @@ class UpdateModelWithReferenceAction(ReferenceActionMixin, UpdateModelAction):
                     logger.warning('Integrity issue - {} Error:{}', str(self), e)
                     return None
 
-        if model_obj and not use_bulk and model_obj.id != self.external_mapping_obj.object_id:
+        if model_obj and not use_bulk and model_obj.pk != self.external_mapping_obj.object_id:
             self.map_to_external_object(self.external_mapping_obj, model_obj)
             self.external_mapping_obj.save()
         return model_obj
@@ -640,7 +643,7 @@ class DeleteIfOnlyReferenceModelAction(ModelAction):
                 obj = self.delete_action.get_object()
                 # Note: Check if obj will be deleted if there is another external system with ref on that object
                 key_mapping = ExternalKeyMapping.objects.get(
-                    object_id=obj.id,
+                    object_id=obj.pk,
                     content_type=ContentType.objects.get_for_model(
                         self.delete_action.model),
                     external_key=self.external_key)
