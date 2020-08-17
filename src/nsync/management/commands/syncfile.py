@@ -1,6 +1,7 @@
 from django.core.management.base import BaseCommand, CommandError
 import os
 import csv
+import ctypes as ct
 
 from .utils import ExternalSystemHelper, ModelFinder, CsvActionFactory
 from nsync.policies import BasicSyncPolicy, TransactionSyncPolicy
@@ -36,7 +37,7 @@ class Command(BaseCommand):
         parser.add_argument(
             '--as_transaction',
             type=bool,
-            default=True,
+            default=False,
             help='Wrap all of the actions in a DB transaction Default:True')
         parser.add_argument(
             '--rel_by_external_key',
@@ -96,6 +97,8 @@ class SyncFileAction:
     def sync(external_system, model, file, use_transaction=True,
              rel_by_external_key=False, rel_by_external_key_excluded=False,
              use_bulk=False, force_init_instance=False):
+        # Increase csv field size limit, set the limit using an artifice
+        csv.field_size_limit(int(ct.c_ulong(-1).value // 2))
         reader = csv.DictReader(file)
         builder = CsvActionFactory(model, external_system=external_system,
                                    rel_by_external_key=rel_by_external_key,
