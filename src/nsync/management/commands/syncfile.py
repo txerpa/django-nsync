@@ -1,3 +1,4 @@
+import logging
 from django.core.management.base import BaseCommand, CommandError
 import os
 import csv
@@ -5,6 +6,8 @@ import ctypes as ct
 
 from .utils import ExternalSystemHelper, ModelFinder, CsvActionFactory
 from nsync.policies import BasicSyncPolicy, TransactionSyncPolicy
+
+logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
@@ -61,6 +64,12 @@ class Command(BaseCommand):
                  'When bulk is enabled, objects are saved using bulk operations'
         )
         parser.add_argument(
+            '--chunk_size',
+            type=int,
+            default=500,
+            help='Controls the size of chunks when load data with bulk. Only used when --use_bulk=true. default: 500'
+        )
+        parser.add_argument(
             '--force_init_instance',
             type=bool,
             default=False,
@@ -88,6 +97,7 @@ class Command(BaseCommand):
                                 rel_by_external_key=options['rel_by_external_key'],
                                 rel_by_external_key_excluded=options['rel_by_external_key_excluded'],
                                 use_bulk=options['use_bulk'],
+                                chunk_size=options['chunk_size'],
                                 force_init_instance=options['force_init_instance']
                                 )
 
@@ -96,7 +106,7 @@ class SyncFileAction:
     @staticmethod
     def sync(external_system, model, file, use_transaction=True,
              rel_by_external_key=False, rel_by_external_key_excluded=False,
-             use_bulk=False, force_init_instance=False):
+             use_bulk=False, chunk_size=500, force_init_instance=False):
         # Increase csv field size limit, set the limit using an artifice
         csv.field_size_limit(int(ct.c_ulong(-1).value // 2))
         reader = csv.DictReader(file)
@@ -109,7 +119,7 @@ class SyncFileAction:
             for d in reader:
                 yield builder.from_dict(d)
 
-        policy = BasicSyncPolicy(get_actions(), use_bulk=use_bulk, model=model)
+        policy = BasicSyncPolicy(get_actions(), use_bulk=use_bulk, batch_size=chunk_size, model=model)
 
         if use_transaction:
             policy = TransactionSyncPolicy(policy)

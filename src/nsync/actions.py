@@ -242,7 +242,7 @@ class ModelAction:
                     if isinstance(field, JSONField) and value:
                         try:
                             value = ast.literal_eval(value)
-                        except ValueError:
+                        except (ValueError, SyntaxError):
                             pass
                 except FieldDoesNotExist:
                     pass
