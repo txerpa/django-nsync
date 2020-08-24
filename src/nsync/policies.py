@@ -112,7 +112,7 @@ class BasicSyncPolicy:
                 self.delete_instances.append(instance)
                 if self.has_batch_size(self.delete_instances):
                     self.bulk_delete()
-        elif instance:
+        elif instance and instance.pk:
             self.num_of_executed_actions += 1
 
     def append_for_bulk(self, action, instance, instances, ref_instances):

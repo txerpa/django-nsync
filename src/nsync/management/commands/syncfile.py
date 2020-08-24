@@ -107,7 +107,7 @@ class SyncFileAction:
     def sync(external_system, model, file, use_transaction=True,
              rel_by_external_key=False, rel_by_external_key_excluded=False,
              use_bulk=False, chunk_size=500, force_init_instance=False):
-        # Increase csv field size limit, set the limit using an artifice
+        # Increase field size limit
         csv.field_size_limit(int(ct.c_ulong(-1).value // 2))
         reader = csv.DictReader(file)
         builder = CsvActionFactory(model, external_system=external_system,

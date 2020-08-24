@@ -193,7 +193,7 @@ class ModelAction:
             )
             return external_key_mapp.object_id
         except ExternalKeyMapping.DoesNotExist as e:
-            logger.warning('External mapping issue - {} Error: {}', str(self), e)
+            logger.warning('External mapping issue - {} Error: {}. External key {}', str(self), e, external_key)
             raise
 
     def execute(self, use_bulk=False):
@@ -455,9 +455,7 @@ class CreateModelWithReferenceAction(ReferenceActionMixin, CreateModelAction):
     update an external reference to the object.
     """
 
-    def __init__(self, external_system, model,
-                 external_key, match_on, fields={}, rel_by_external_key=False,
-                 rel_by_external_key_excluded=False, force_init_instance=False):
+    def __init__(self, external_system, model, external_key, match_on, **kwargs):
         """
 
         :param external_system (model object): The external system to create or
@@ -467,15 +465,9 @@ class CreateModelWithReferenceAction(ReferenceActionMixin, CreateModelAction):
             model object).
         :param model (class): See definition on super class
         :param match_on (list): See definition on super class
-        :param fields(dict): See definition on super class
-        :param rel_by_external_key(bool): See definition on super class
-        :param rel_by_external_key_excluded (list): See definition on super class
-        :return: The model object provided by the action
         """
         super(CreateModelWithReferenceAction, self).__init__(
-            model, match_on, fields=fields, rel_by_external_key=rel_by_external_key,
-            rel_by_external_key_excluded=rel_by_external_key_excluded, external_system=external_system,
-            force_init_instance=force_init_instance
+            model, match_on, external_system=external_system, **kwargs
         )
         self.external_key = external_key
 
@@ -500,7 +492,7 @@ class UpdateModelAction(ModelAction):
     object.
     """
 
-    def __init__(self, model, match_on, fields={}, force_update=False):
+    def __init__(self, model, match_on, force_update=False, **kwargs):
         """
         Create an Update action to be executed in the future.
 
@@ -514,7 +506,7 @@ class UpdateModelAction(ModelAction):
             forced or only affect 'empty' fields. Default:False
         :return: The updated object (if a matching object is found) or None.
         """
-        super(UpdateModelAction, self).__init__(model, match_on, fields)
+        super(UpdateModelAction, self).__init__(model, match_on, **kwargs)
         self.force_update = force_update
 
     @property
@@ -549,8 +541,7 @@ class UpdateModelWithReferenceAction(ReferenceActionMixin, UpdateModelAction):
     update an external reference to the object.
     """
 
-    def __init__(self, external_system, model, external_key, match_on,
-                 fields={}, force_update=False, rel_by_external_key=False, rel_by_external_key_excluded=False):
+    def __init__(self, external_system, model, external_key, match_on, **kwargs):
         """
 
         :param external_system (model object): The external system to create or
@@ -561,14 +552,9 @@ class UpdateModelWithReferenceAction(ReferenceActionMixin, UpdateModelAction):
 
         :param model (class): See definition on super class
         :param match_on (list): See definition on super class
-        :param fields(dict): See definition on super class
-        :param rel_by_external_key(bool): See definition on super class
-        :param rel_by_external_key_excluded (list): See definition on super class
-        :return: The updated object (if an object is found) or None.
         """
         super(UpdateModelWithReferenceAction, self).__init__(
-            model, match_on, fields=fields, force_update=force_update, rel_by_external_key=rel_by_external_key,
-            rel_by_external_key_excluded=rel_by_external_key_excluded, external_system=external_system)
+            model, match_on, external_system=external_system, **kwargs)
         self.external_key = external_key
 
     def execute(self, use_bulk=False):
@@ -826,13 +812,13 @@ class ActionFactory:
         :return:
         """
         actions = []
-
+        action_kwargs = dict(
+            fields=fields,
+            rel_by_external_key=self.rel_by_external_key,
+            rel_by_external_key_excluded = self.rel_by_external_key_excluded
+        )
         if sync_actions.is_impotent():
-            actions.append(ModelAction(self.model, match_on,
-                                       fields=fields,
-                                       rel_by_external_key=self.rel_by_external_key,
-                                       rel_by_external_key_excluded=self.rel_by_external_key_excluded
-                                       ))
+            actions.append(ModelAction(self.model, match_on, **action_kwargs))
 
         if sync_actions.delete:
             action = DeleteModelAction(self.model, match_on, fields=fields)
@@ -853,13 +839,12 @@ class ActionFactory:
                     self.model,
                     external_system_key,
                     match_on,
-                    fields=fields,
-                    rel_by_external_key=self.rel_by_external_key,
-                    rel_by_external_key_excluded=self.rel_by_external_key_excluded,
-                    force_init_instance=self.force_init_instance
+                    force_init_instance=self.force_init_instance, **action_kwargs
                 )
             else:
-                action = CreateModelAction(self.model, match_on, fields, force_init_instance=self.force_init_instance)
+                action = CreateModelAction(self.model, match_on,
+                                           force_init_instance=self.force_init_instance,
+                                           external_system=self.external_system, **action_kwargs)
             actions.append(action)
         if sync_actions.update:
             if self.is_externally_mappable(external_system_key):
@@ -868,13 +853,14 @@ class ActionFactory:
                     self.model,
                     external_system_key,
                     match_on,
-                    fields=fields,
                     force_update=sync_actions.force,
-                    rel_by_external_key=self.rel_by_external_key,
-                    rel_by_external_key_excluded=self.rel_by_external_key_excluded)
+                    **action_kwargs)
             else:
                 action = UpdateModelAction(self.model, match_on,
-                                           fields, sync_actions.force)
+                                           force_update=sync_actions.force,
+                                           external_system=self.external_system,
+                                           **action_kwargs
+                                           )
 
             actions.append(action)
 
