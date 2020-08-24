@@ -5,7 +5,7 @@ import csv
 import ctypes as ct
 
 from .utils import ExternalSystemHelper, ModelFinder, CsvActionFactory
-from nsync.policies import BasicSyncPolicy, TransactionSyncPolicy
+from nsync.policies import BasicSyncPolicy, BulkSyncPolicy, TransactionSyncPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -115,12 +115,13 @@ class SyncFileAction:
                                    rel_by_external_key_excluded=rel_by_external_key_excluded,
                                    force_init_instance=force_init_instance)
 
-        def get_actions():
-            for d in reader:
-                yield builder.from_dict(d)
+        actions_generator = (builder.from_dict(d) for d in reader)
 
-        policy = BasicSyncPolicy(get_actions(), use_bulk=use_bulk, batch_size=chunk_size, model=model)
+        policy_class, policy_kwargs = BasicSyncPolicy, dict()
+        if use_bulk:
+            policy_class, policy_kwargs = BulkSyncPolicy, dict(batch_size=chunk_size)
 
+        policy = policy_class(actions_generator, model=model, **policy_kwargs)
         if use_transaction:
             policy = TransactionSyncPolicy(policy)
 

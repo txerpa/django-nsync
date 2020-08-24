@@ -13,46 +13,62 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
-class BasicSyncPolicy:
-    """A synchronisation policy that simply executes each action in order."""
+class AutoNowMixin:
+    disabled_auto_now_date_fields = None
+
+    def __init__(self, *args, **kwargs):
+        self.disabled_auto_now_date_fields = list()
+
+    def turn_off_auto_now(self):
+        """
+        Disable auto_now/auto_now_add of date fields in order to be able to save original date
+        instead of the current date
+        """
+        for field_name in self.header:
+            try:
+                field = self.model._meta.get_field(field_name)
+            except FieldDoesNotExist:
+                continue
+            if isinstance(field, DateField) and (field.auto_now or field.auto_now_add):
+                field.auto_now = False
+                field.auto_now_add = False
+                self.disabled_auto_now_date_fields.append(field)
+
+    def turn_on_auto_now(self):
+        """
+        Enable back on disabled auto_now/auto_now_add for date fields
+        :return:
+        """
+        for disabled_auto_now_field in self.disabled_auto_now_date_fields:
+            disabled_auto_now_field.auto_now = True
+            disabled_auto_now_field.auto_now_add = True
+
+
+class BasicSyncPolicy(AutoNowMixin):
+    """ A synchronisation policy that simply executes each action in order. """
 
     CREATE = 'create'
     UPDATE = 'update'
     DELETE = 'delete'
 
-    def __init__(self, actions, use_bulk=False, batch_size=None, model=None):
-        """
-        :param actions: Generator that yields action items
-        :param use_bulk: (Optional) If operations should be performed in bulk
-        :param batch_size: Controls how many objects are created in a single query.
-        The default is to create objects in batches of 400. This parameter is only used if ``use_bulk`` is True.
-        :param model: The model to create/update/delete against in bulk.
-        This parameter is obligatory when ``use_bulk`` is True.
-        """
+    action = None
+    model = None
+
+    header = []
+
+    num_of_model_actions = 0
+    num_of_executed_actions = 0
+
+    def __init__(self, actions, model=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
         self.actions = actions
-        self.use_bulk = use_bulk
-        self.batch_size = batch_size or 500
         self.model = model
-        if self.use_bulk and not model:
-            raise ValueError('Model is obliagatory when bulk is used')
-
-        # lists to hold model instances in memory when bulk operations are enabled
-        self.create_instances = list()
-        self.create_ref_instances = list()
-        self.update_instances = list()
-        self.update_ref_instances = list()
-        self.delete_instances = list()
-
-        self.disabled_auto_now_date_fields = list()
-        self.header = []
-
-        self.num_of_model_actions = 0
-        self.num_of_executed_actions = 0
 
     def execute(self, actions=None):
         # When bulk oper is used signals are disabled by default, so check if signals have to be disabled
         # in the case bulk is not used
-        if not self.use_bulk and settings.SYNC_SIGNAL_DISCONNECT:
+        if settings.SYNC_SIGNAL_DISCONNECT:
             model_name = self.model._meta.model_name
             post_save_receiver, post_save_dispatch = get_signal_info('post_save', model_name)
             post_save_kwargs = {
@@ -73,11 +89,6 @@ class BasicSyncPolicy:
         else:
             self.execute_actions(actions)
 
-        if self.use_bulk:
-            # bulk persist any instances which are still pending
-            self.bulk_create_with_ref()
-            self.bulk_update_with_ref()
-            self.bulk_delete()
         self.turn_on_auto_now()
         if self.num_of_model_actions != self.num_of_executed_actions:
             logger.warning(f'Actions are skipped! {self.num_of_model_actions - self.num_of_executed_actions} '
@@ -97,8 +108,89 @@ class BasicSyncPolicy:
             self.num_of_model_actions += len(row_action_types)
 
     def execute_row_action(self, action):
-        instance = action.execute(use_bulk=self.use_bulk)
-        if self.use_bulk and instance:
+        instance = action.execute(use_bulk=False)
+        if instance and instance.pk:
+            self.num_of_executed_actions += 1
+
+
+class BulkSyncPolicy(AutoNowMixin):
+    """ A synchronisation policy that executes actions in batch. """
+
+    CREATE = 'create'
+    UPDATE = 'update'
+    DELETE = 'delete'
+
+    action = None
+    model = None
+
+    header = []
+
+    num_of_model_actions = 0
+    num_of_executed_actions = 0
+
+    # lists to hold model instances in memory when bulk operations are enabled
+    create_instances = list()
+    create_ref_instances = list()
+    update_instances = list()
+    update_ref_instances = list()
+    delete_instances = list()
+
+    def __init__(self, actions, model, batch_size=500, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.actions = actions
+        self.batch_size = 500 if not isinstance(batch_size, int) else batch_size
+        self.model = model
+
+    def execute(self, actions=None):
+        # When bulk oper is used signals are disabled by default, so check if signals have to be disabled
+        # in the case bulk is not used
+        model_name = self.model._meta.model_name
+        post_save_receiver, post_save_dispatch = get_signal_info('post_save', model_name)
+        post_save_kwargs = {
+            'signal': signals.post_save,
+            'receiver': post_save_receiver,
+            'sender': self.model,
+            'dispatch_uid': post_save_dispatch
+        }
+        post_delete_receiver, post_delte_dispatch = get_signal_info('post_delete', model_name)
+        post_delete_kwargs = {
+            'signal': signals.post_delete,
+            'receiver': post_delete_receiver,
+            'sender': self.model,
+            'dispatch_uid': post_delte_dispatch
+        }
+
+        with temp_disconnect_signal(**post_save_kwargs), temp_disconnect_signal(**post_delete_kwargs):
+            self.execute_actions(actions)
+
+        # bulk persist any instances which are still pending
+        self.bulk_create_with_ref()
+        self.bulk_update_with_ref()
+        self.bulk_delete()
+
+        self.turn_on_auto_now()
+
+        if self.num_of_model_actions != self.num_of_executed_actions:
+            logger.warning(f'Actions are skipped! {self.num_of_model_actions - self.num_of_executed_actions} '
+                           f'actions are not executed for the model {self.model._meta.db_table}')
+
+    def execute_actions(self, actions):
+        actions = actions or self.actions
+        for row_actions in actions:
+            row_action_types = []
+            for action in row_actions:
+                if action.type not in row_action_types:
+                    row_action_types.append(action.type)
+                if action.type != self.DELETE and not self.header:
+                    self.header = action.fields.keys()
+                    self.turn_off_auto_now()
+                self.execute_row_action(action)
+            self.num_of_model_actions += len(row_action_types)
+
+    def execute_row_action(self, action):
+        instance = action.execute(use_bulk=True)
+        if instance:
             # Note: It is important to keep this order of bulk action execution -> create-update-delete
             if action.type == self.CREATE and not action.obj_already_created:
                 self.append_for_bulk(action, instance, self.create_instances, self.create_ref_instances)
@@ -112,8 +204,6 @@ class BasicSyncPolicy:
                 self.delete_instances.append(instance)
                 if self.has_batch_size(self.delete_instances):
                     self.bulk_delete()
-        elif instance and instance.pk:
-            self.num_of_executed_actions += 1
 
     def append_for_bulk(self, action, instance, instances, ref_instances):
         instances.append(instance)
@@ -200,30 +290,6 @@ class BasicSyncPolicy:
             logger.exception(e)
         finally:
             self.delete_instances.clear()
-
-    def turn_off_auto_now(self):
-        """
-        Disable auto_now/auto_now_add of date fields in order to be able to save original date
-        instead of the current date
-        """
-        for field_name in self.header:
-            try:
-                field = self.model._meta.get_field(field_name)
-            except FieldDoesNotExist:
-                continue
-            if isinstance(field, DateField) and (field.auto_now or field.auto_now_add):
-                field.auto_now = False
-                field.auto_now_add = False
-                self.disabled_auto_now_date_fields.append(field)
-
-    def turn_on_auto_now(self):
-        """
-        Enable back on disabled auto_now/auto_now_add for date fields
-        :return:
-        """
-        for disabled_auto_now_field in self.disabled_auto_now_date_fields:
-            disabled_auto_now_field.auto_now = True
-            disabled_auto_now_field.auto_now_add = True
 
 
 class TransactionSyncPolicy:
