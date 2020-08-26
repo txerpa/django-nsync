@@ -1,10 +1,14 @@
-from django.db import transaction
+import inspect
+from itertools import tee
+
+from django.contrib.contenttypes.models import ContentType
+from django.db import transaction, connection
 from django.core.exceptions import FieldDoesNotExist
 from django.conf import settings
 from .actions import ReferenceActionMixin
-from .models import ExternalKeyMapping
+from .models import ExternalKeyMapping, ExternalSystem
 from django.db.models.fields import DateField
-from django.db.models import signals
+from django.db.models import signals, Max
 from .management.commands.utils import temp_disconnect_signal, get_signal_info
 import logging
 
@@ -123,24 +127,24 @@ class BulkSyncPolicy(AutoNowMixin):
     action = None
     model = None
 
-    header = []
-
-    num_of_model_actions = 0
-    num_of_executed_actions = 0
-
-    # lists to hold model instances in memory when bulk operations are enabled
-    create_instances = list()
-    create_ref_instances = list()
-    update_instances = list()
-    update_ref_instances = list()
-    delete_instances = list()
-
     def __init__(self, actions, model, batch_size=500, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.actions = actions
         self.batch_size = 500 if not isinstance(batch_size, int) else batch_size
         self.model = model
+
+        self.header = []
+
+        self.num_of_model_actions = 0
+        self.num_of_executed_actions = 0
+
+        # lists to hold model instances in memory when bulk operations are enabled
+        self.create_instances = list()
+        self.create_ref_instances = list()
+        self.update_instances = list()
+        self.update_ref_instances = list()
+        self.delete_instances = list()
 
     def execute(self, actions=None):
         # When bulk oper is used signals are disabled by default, so check if signals have to be disabled
@@ -290,6 +294,94 @@ class BulkSyncPolicy(AutoNowMixin):
             logger.exception(e)
         finally:
             self.delete_instances.clear()
+
+
+class MPTTBulkSyncPolicy(BulkSyncPolicy):
+    """ A synchronisation policy that executes actions in batch. """
+
+    CREATE = 'create'
+    UPDATE = 'update'
+    DELETE = 'delete'
+
+    pk_offset = None
+    # external_to_internal_map = dict()
+
+    def __init__(self, actions, model, batch_size=500, *args, **kwargs):
+        super().__init__(actions, model, batch_size=batch_size, *args, **kwargs)
+
+    def execute(self, actions=None):
+        if self.pk_offset is None:
+            self.compute_pk_offset()
+
+        actions = actions or self.actions
+        if inspect.isgenerator(actions):
+            # Duplicate the original actions generator
+            actions_1, actions_2 = tee(actions)
+        else:
+            actions_1, actions_2 = actions, actions
+
+        external_system = ExternalSystem.objects.first()
+        dct = ContentType.objects.get(model=self.model._meta.model_name, app_label=self.model._meta.app_label)
+
+        # Map all pks
+        mapped_objects = list()
+        mapped_external_keys = set()
+        n = 0
+        for row_actions in actions_1:
+            for action in row_actions:
+                # TODO: This not works as expected for me but i don't know why... :S
+                # assert action.type != 'create', f"{self.__class__.__name__} can only be used with \"create\" actions"
+
+                external_pk = action.external_key
+                if external_pk in mapped_external_keys:
+                    continue
+
+                n += 1
+                new_inernal_pk = self.pk_offset + n
+
+                external_obj = ExternalKeyMapping()
+                external_obj.object_id = new_inernal_pk
+                external_obj.content_type = dct
+                external_obj.external_key = external_pk
+                external_obj.external_system = external_system  # TODO: Only exists one?
+
+                mapped_external_keys.add(external_pk)
+                mapped_objects.append(external_obj)
+
+                # self.external_to_internal_map[external_pk] = new_inernal_pk
+                action.external_mapping_obj = external_obj
+
+        ExternalKeyMapping.objects.bulk_create(mapped_objects)
+
+        super().execute(actions=actions_2)
+
+        # Update table's pk sequence on postgres with last inserted id
+        self.update_table_pk_sequence(self.model._meta.db_table)
+
+    def bulk_create_with_ref(self):
+        created_instances = self.bulk_create(self.model, self.create_instances)
+        self.num_of_executed_actions += len(created_instances)
+
+    def bulk_update_with_ref(self):
+        updated_instances = self.bulk_update(self.model, self.update_instances, self.header)
+        self.num_of_executed_actions += len(updated_instances)
+
+    def compute_pk_offset(self):
+        res = self.model.objects.aggregate(max_id=Max('pk'))
+        self.pk_offset = res.get('max_id') or 0
+
+    def update_table_pk_sequence(self, table_name):
+        with transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                BEGIN;
+                -- protect against concurrent inserts while you update the counter
+                LOCK TABLE {table_name} IN EXCLUSIVE MODE;
+                -- Update the sequence
+                SELECT setval('{table_name}_id_seq', COALESCE((SELECT MAX(id)+1 FROM {table_name}), 1), false);
+                COMMIT;
+                """
+            )
 
 
 class TransactionSyncPolicy:

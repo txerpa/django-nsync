@@ -4,8 +4,11 @@ import os
 import csv
 import ctypes as ct
 
+from django.db.models import Model
+from mptt.models import MPTTModel
+
 from .utils import ExternalSystemHelper, ModelFinder, CsvActionFactory
-from nsync.policies import BasicSyncPolicy, BulkSyncPolicy, TransactionSyncPolicy
+from nsync.policies import BasicSyncPolicy, BulkSyncPolicy, MPTTBulkSyncPolicy, TransactionSyncPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +122,11 @@ class SyncFileAction:
 
         policy_class, policy_kwargs = BasicSyncPolicy, dict()
         if use_bulk:
-            policy_class, policy_kwargs = BulkSyncPolicy, dict(batch_size=chunk_size)
+            if issubclass(model, MPTTModel):
+                policy_class, policy_kwargs = MPTTBulkSyncPolicy, dict(batch_size=chunk_size)
+            else:
+                policy_class, policy_kwargs = BulkSyncPolicy, dict(batch_size=chunk_size)
+            logger.debug(f" > Using sync policy class \"{policy_class}\" for model \"{model}\".")
 
         policy = policy_class(actions_generator, model=model, **policy_kwargs)
         if use_transaction:

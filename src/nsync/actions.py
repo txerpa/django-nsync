@@ -86,7 +86,7 @@ class ObjectSelector:
         self.fields = available_fields
 
     def __str__(self):
-        return self.match_on
+        return str(self.match_on)
 
     def get_by(self):
         def build_selector(match):
