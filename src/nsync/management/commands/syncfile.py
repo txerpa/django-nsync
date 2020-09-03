@@ -90,12 +90,12 @@ class Command(BaseCommand):
         if not os.path.exists(filename):
             raise CommandError("Filename '{}' not found".format(filename))
 
-        with open(filename) as f:
+        with open(filename) as file:
             # TODO - Review - This indirection is only due to issues in
             # getting the mocks in the tests to work
             SyncFileAction.sync(external_system,
                                 model,
-                                f,
+                                file,
                                 use_transaction=options['as_transaction'],
                                 rel_by_external_key=options['rel_by_external_key'],
                                 rel_by_external_key_excluded=options['rel_by_external_key_excluded'],
@@ -126,7 +126,7 @@ class SyncFileAction:
                 policy_class, policy_kwargs = MPTTBulkSyncPolicy, dict(batch_size=chunk_size)
             else:
                 policy_class, policy_kwargs = BulkSyncPolicy, dict(batch_size=chunk_size)
-            logger.debug(f" > Using sync policy class \"{policy_class}\" for model \"{model}\".")
+            # logger.debug(f" > Using sync policy class \"{policy_class}\" for model \"{model}\".")
 
         policy = policy_class(actions_generator, model=model, **policy_kwargs)
         if use_transaction:

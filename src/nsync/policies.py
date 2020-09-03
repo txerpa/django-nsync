@@ -299,10 +299,6 @@ class BulkSyncPolicy(AutoNowMixin):
 class MPTTBulkSyncPolicy(BulkSyncPolicy):
     """ A synchronisation policy that executes actions in batch. """
 
-    CREATE = 'create'
-    UPDATE = 'update'
-    DELETE = 'delete'
-
     pk_offset = None
     # external_to_internal_map = dict()
 
@@ -320,6 +316,7 @@ class MPTTBulkSyncPolicy(BulkSyncPolicy):
         else:
             actions_1, actions_2 = actions, actions
 
+        # TODO: review this two lines... must be passed in instead of getting this way?
         external_system = ExternalSystem.objects.first()
         dct = ContentType.objects.get(model=self.model._meta.model_name, app_label=self.model._meta.app_label)
 
@@ -329,7 +326,7 @@ class MPTTBulkSyncPolicy(BulkSyncPolicy):
         n = 0
         for row_actions in actions_1:
             for action in row_actions:
-                # TODO: This not works as expected for me but i don't know why... :S
+                # TODO: This not works as expected but I don't know why... :S
                 # assert action.type != 'create', f"{self.__class__.__name__} can only be used with \"create\" actions"
 
                 external_pk = action.external_key
@@ -337,10 +334,10 @@ class MPTTBulkSyncPolicy(BulkSyncPolicy):
                     continue
 
                 n += 1
-                new_inernal_pk = self.pk_offset + n
+                new_internal_pk = self.pk_offset + n
 
                 external_obj = ExternalKeyMapping()
-                external_obj.object_id = new_inernal_pk
+                external_obj.object_id = new_internal_pk
                 external_obj.content_type = dct
                 external_obj.external_key = external_pk
                 external_obj.external_system = external_system  # TODO: Only exists one?
@@ -348,8 +345,8 @@ class MPTTBulkSyncPolicy(BulkSyncPolicy):
                 mapped_external_keys.add(external_pk)
                 mapped_objects.append(external_obj)
 
-                # self.external_to_internal_map[external_pk] = new_inernal_pk
-                action.external_mapping_obj = external_obj
+                action.force_init_instace = False
+                # action.external_mapping_obj = external_obj
 
         ExternalKeyMapping.objects.bulk_create(mapped_objects)
 
@@ -382,6 +379,7 @@ class MPTTBulkSyncPolicy(BulkSyncPolicy):
                 COMMIT;
                 """
             )
+            logger.info(f" > Table pk sequence updated: {table_name}")
 
 
 class TransactionSyncPolicy:

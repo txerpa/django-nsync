@@ -189,7 +189,8 @@ class ModelAction:
             external_key_mapp = ExternalKeyMapping.objects.get(
                 external_system=self.external_system,
                 external_key=external_key,
-                content_type=content_type
+                content_type=content_type,
+                tenant=connection.schema_name
             )
             return external_key_mapp.object_id
         except ExternalKeyMapping.DoesNotExist as e:
@@ -437,6 +438,7 @@ class ReferenceActionMixin:
                 external_system=self.external_system,
                 external_key=self.external_key,
                 content_type=ContentType.objects.get_for_model(self.model),
+                tenant=connection.schema_name
             )
         except ExternalKeyMapping.DoesNotExist:
             mapping = mapping_inst
@@ -483,7 +485,7 @@ class CreateModelWithReferenceAction(ReferenceActionMixin, CreateModelAction):
         return model_obj
 
 
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, transaction, connection
 
 
 class UpdateModelAction(ModelAction):
